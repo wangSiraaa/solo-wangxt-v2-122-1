@@ -223,31 +223,15 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 
 	var prev *zone.Snapshot
 	if prevSerial > 0 {
-		rows, err := tx.Query(ctx,
-			`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position`, prevSerial)
-		if err != nil {
-			return nil, err
-		}
-		prevRRs, err := scanRRs(rows)
-		rows.Close()
-		if err != nil {
-			return nil, err
-		}
-		prev, err = zone.NewSnapshot(s.origin, uint32(prevSerial), prevRRs)
+		prev, err = s.loadSnapshotTx(ctx, tx, uint32(prevSerial))
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	// Re-validate against configured TTL bounds and zone semantics.
-	checked := make([]dns.RR, 0, len(rrs))
-	for _, rr := range rrs {
-		if err := validateOne(rr, s.origin, lim); err != nil {
-			return nil, err
-		}
-		checked = append(checked, rr)
-	}
-	if err := validateAgainst(checked, s.origin, lim); err != nil {
+	checked, err := validateCandidate(rrs, s.origin, lim)
+	if err != nil {
 		return nil, err
 	}
 
@@ -296,6 +280,111 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 	s.notify(ctx, nextSerial)
 
 	return &PublishResult{Serial: uint32(nextSerial), Changes: changes}, nil
+}
+
+// loadSnapshotTx reconstructs a snapshot from a version's records using the
+// given queryer (a transaction during publish, the pool for preview).
+func (s *Store) loadSnapshotTx(ctx context.Context, q pgQuerier, serial uint32) (*zone.Snapshot, error) {
+	rows, err := q.Query(ctx,
+		`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position`, int64(serial))
+	if err != nil {
+		return nil, err
+	}
+	prevRRs, err := scanRRs(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	return zone.NewSnapshot(s.origin, serial, prevRRs)
+}
+
+// pgQuerier is the subset of pgx.Pool/Tx used by read-only snapshot loads.
+type pgQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// PreviewResult is the projected outcome of publishing a candidate zone
+// file without performing the publish. Nothing is written: no serial is
+// allocated, no version/changelog rows are inserted, the current pointer
+// does not move and no LISTEN notification is sent.
+type PreviewResult struct {
+	Origin         string
+	CurrentSerial  uint32              // serial currently served (0 before first publish)
+	NextSerial     uint32              // serial the candidate WOULD get on publish
+	CandidateCount int                 // records in the candidate, including the SOA
+	CurrentCount   int                 // records in the current version (0 if none)
+	Changes        []zone.Change       // exact DEL/ADD rows publish would log
+	RecordChanges  []zone.RecordChange // grouped add/del/content/TTL view
+	AffectedNames  []string            // owner names touched by RecordChanges
+}
+
+// Preview runs the exact parsing-independent validation a publish performs
+// inside its transaction and projects the changelog against the current
+// version, but performs only plain reads. It never opens a write
+// transaction, takes the meta-row lock, writes rows or notifies servers,
+// so a running service keeps serving the current snapshot.
+func (s *Store) Preview(ctx context.Context, rrs []dns.RR, lim zone.Limits) (*PreviewResult, error) {
+	currentSerial, err := s.CurrentSerial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var prev *zone.Snapshot
+	if currentSerial > 0 {
+		prev, err = s.loadSnapshotTx(ctx, s.pool, currentSerial)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Same defense-in-depth validation publishOnce runs at commit time.
+	checked, err := validateCandidate(rrs, s.origin, lim)
+	if err != nil {
+		return nil, err
+	}
+
+	// Serial is only rewritten onto an in-memory copy for diffing; nothing
+	// reaches the database or any serving snapshot.
+	nextSerial := currentSerial + 1
+	candidate, err := zone.NewSnapshot(s.origin, nextSerial, checked)
+	if err != nil {
+		return nil, err
+	}
+
+	recordChanges := zone.Describe(prev, candidate)
+	return &PreviewResult{
+		Origin:         s.origin,
+		CurrentSerial:  currentSerial,
+		NextSerial:     nextSerial,
+		CandidateCount: len(candidate.RRs),
+		CurrentCount:   len(prevRRs(prev)),
+		Changes:        zone.Diff(prev, candidate),
+		RecordChanges:  recordChanges,
+		AffectedNames:  zone.AffectedNames(recordChanges),
+	}, nil
+}
+
+func prevRRs(snap *zone.Snapshot) []dns.RR {
+	if snap == nil {
+		return nil
+	}
+	return snap.RRs
+}
+
+// validateCandidate applies the same per-record and whole-set checks
+// publishOnce uses inside its transaction. Extracted so preview and
+// publish can never drift apart in what they accept.
+func validateCandidate(rrs []dns.RR, origin string, lim zone.Limits) ([]dns.RR, error) {
+	checked := make([]dns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		if err := validateOne(rr, origin, lim); err != nil {
+			return nil, err
+		}
+		checked = append(checked, rr)
+	}
+	if err := validateAgainst(checked, origin, lim); err != nil {
+		return nil, err
+	}
+	return checked, nil
 }
 
 // LoadChanges returns the stored changelog for a version (IXFR deltas).

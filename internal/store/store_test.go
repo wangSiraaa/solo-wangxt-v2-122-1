@@ -250,3 +250,226 @@ www IN A 127.0.0.21
 	}
 	return base
 }
+
+func TestPreviewProjectsChangesWithoutWriting(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := s.Preview(ctx, parse(t, content(2)), lim)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if p.CurrentSerial != 1 || p.NextSerial != 2 {
+		t.Fatalf("serials current=%d next=%d, want 1/2", p.CurrentSerial, p.NextSerial)
+	}
+	if len(p.Changes) != 1 || p.Changes[0].Action != "ADD" {
+		t.Fatalf("projected changelog = %v, want one ADD", p.Changes)
+	}
+	if rc := p.RecordChanges; len(rc) != 1 || rc[0].Kind != zone.RecordAdded ||
+		rc[0].Name != "host2.lab.test." {
+		t.Fatalf("record changes = %+v, want one addition of host2", rc)
+	}
+	if names := p.AffectedNames; len(names) != 1 || names[0] != "host2.lab.test." {
+		t.Fatalf("affected names = %v", names)
+	}
+
+	// Nothing moved: current pointer, version rows and changelog rows stay
+	// exactly as after v1.
+	serial, err := s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("current serial after preview = %d, want 1", serial)
+	}
+	var versions, changeRows int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_versions`).Scan(&versions); err != nil || versions != 1 {
+		t.Fatalf("zone_versions rows=%d, want 1", versions)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_changes WHERE serial=2`).Scan(&changeRows); err != nil || changeRows != 0 {
+		t.Fatalf("changelog rows for serial 2 = %d, want 0 (preview writes nothing)", changeRows)
+	}
+}
+
+func TestPreviewRejectsInvalidCandidateAndLeavesServiceVersion(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	mustRR := func(text string) dns.RR {
+		rr, err := dns.NewRR(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rr
+	}
+	soa := snapSOA(t, s, 1)
+
+	// Illegal TTL: rejected at parse time with a message naming TTL and the
+	// bound, and independently by the store's commit-time defense when raw
+	// RRs bypass the parser.
+	badTTLText := strings.Replace(content(0), "ns1 IN A 127.0.0.10",
+		"ns1 5 IN A 127.0.0.10", 1)
+	if _, err := zone.Parse(strings.NewReader(badTTLText), origin, lim); err == nil {
+		t.Fatal("Parse must reject TTL 5 below minimum 30")
+	} else if !strings.Contains(err.Error(), "TTL") {
+		t.Fatalf("parse error must explain the TTL violation, got: %v", err)
+	}
+	badTTLRRs := []dns.RR{
+		soa,
+		mustRR("lab.test. 3600 IN NS ns1.lab.test."),
+		mustRR("ns1.lab.test. 5 IN A 127.0.0.10"),
+		mustRR("www.lab.test. 3600 IN A 127.0.0.20"),
+		mustRR("www.lab.test. 3600 IN A 127.0.0.21"),
+	}
+	if _, err := s.Preview(ctx, badTTLRRs, lim); err == nil {
+		t.Fatal("Preview must reject TTL below minimum")
+	}
+
+	// CNAME/other coexistence: same two-layer rejection.
+	badCNAME := content(0) + "www IN CNAME elsewhere.lab.test.\n"
+	if _, perr := zone.Parse(strings.NewReader(badCNAME), origin, lim); perr == nil {
+		t.Fatal("Parse must reject CNAME coexisting with A records")
+	} else if !strings.Contains(perr.Error(), "CNAME") {
+		t.Fatalf("parse error must name the CNAME conflict: %v", perr)
+	}
+	rawConflict := []dns.RR{
+		soa,
+		mustRR("lab.test. 3600 IN NS ns1.lab.test."),
+		mustRR("ns1.lab.test. 3600 IN A 127.0.0.10"),
+		mustRR("www.lab.test. 3600 IN A 127.0.0.20"),
+		mustRR("www.lab.test. 3600 IN CNAME conflict.lab.test."),
+	}
+	if _, err := s.Preview(ctx, rawConflict, lim); err == nil {
+		t.Fatal("store Preview must reject CNAME/other coexistence")
+	}
+
+	// Service still answers serial 1; no row of any kind appeared.
+	if serial, _ := s.CurrentSerial(ctx); serial != 1 {
+		t.Fatalf("current serial = %d after rejected previews, want 1", serial)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_versions`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("zone_versions rows = %d, want 1", n)
+	}
+}
+
+func TestPreviewChangelogMatchesActualPublishChangelog(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate mixes all change kinds: add (host3), unpaired delete
+	// (www .21 disappears alongside the .20->.23 replacement), rdata
+	// content change and a pure TTL change.
+	candidate := `$ORIGIN lab.test.
+$TTL 3600
+@ IN SOA ns1.lab.test. admin.lab.test. (1 7200 3600 1209600 300)
+@ IN NS ns1.lab.test.
+ns1 7200 IN A 127.0.0.10
+www IN A 127.0.0.23
+host3 IN A 127.0.0.40
+`
+	rrs := parse(t, candidate)
+	p, err := s.Preview(ctx, rrs, lim)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if serial, _ := s.CurrentSerial(ctx); serial != 1 {
+		t.Fatalf("serial moved after preview: %d", serial)
+	}
+
+	res, err := s.Publish(ctx, rrs, "v2", lim)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if res.Serial != 2 {
+		t.Fatalf("published serial = %d, want 2", res.Serial)
+	}
+	stored, err := s.LoadChanges(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := func(c zone.Change) string { return c.Action + " " + zone.CanonicalText(c.RR) }
+	if len(stored) != len(p.Changes) {
+		t.Fatalf("preview projected %d changelog rows, publish stored %d",
+			len(p.Changes), len(stored))
+	}
+	for i := range stored {
+		if got, want := key(stored[i]), key(p.Changes[i]); got != want {
+			t.Fatalf("changelog row %d:\npreview: %s\nstored:  %s", i, want, got)
+		}
+	}
+
+	// Grouped view must classify every kind and name only real owners.
+	kinds := map[string]bool{}
+	names := map[string]bool{}
+	for _, rc := range p.RecordChanges {
+		kinds[rc.Kind] = true
+		names[rc.Name] = true
+	}
+	for _, k := range []string{zone.RecordAdded, zone.RecordDeleted,
+		zone.RecordContentChanged, zone.RecordTTLChanged} {
+		if !kinds[k] {
+			t.Errorf("expected a %s record change, kinds=%v", k, kinds)
+		}
+	}
+	if !names["www.lab.test."] || !names["host3.lab.test."] || !names["ns1.lab.test."] {
+		t.Fatalf("affected owners wrong: %v", names)
+	}
+}
+
+func TestPreviewIdenticalFileShowsNoRecordChanges(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	rrs := parse(t, content(0))
+	if _, err := s.Publish(ctx, rrs, "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+	// Re-preview exactly the published records; SOA serial rewriting must not
+	// appear as a change (SOA is excluded from the diff).
+	p, err := s.Preview(ctx, rrs, lim)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if len(p.Changes) != 0 || len(p.RecordChanges) != 0 || len(p.AffectedNames) != 0 {
+		t.Fatalf("identical candidate projected changes: %+v", p.RecordChanges)
+	}
+	if p.NextSerial != 2 {
+		t.Fatalf("projected serial = %d, want 2 even with empty diff", p.NextSerial)
+	}
+	if serial, _ := s.CurrentSerial(ctx); serial != 1 {
+		t.Fatalf("serial = %d, preview must not publish", serial)
+	}
+}
+
+func TestPreviewBeforeFirstVersionTreatsAllAsAdded(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	p, err := s.Preview(ctx, parse(t, content(2)), lim)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if p.CurrentSerial != 0 || p.NextSerial != 1 || p.CurrentCount != 0 {
+		t.Fatalf("first-version preview = serial %d->%d currentCount=%d",
+			p.CurrentSerial, p.NextSerial, p.CurrentCount)
+	}
+	for _, rc := range p.RecordChanges {
+		if rc.Kind != zone.RecordAdded {
+			t.Fatalf("first preview must only contain additions, got %+v", rc)
+		}
+	}
+	if serial, _ := s.CurrentSerial(ctx); serial != 0 {
+		t.Fatalf("serial = %d, preview must not publish", serial)
+	}
+}

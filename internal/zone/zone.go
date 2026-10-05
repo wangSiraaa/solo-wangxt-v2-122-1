@@ -321,31 +321,72 @@ type Change struct {
 	RR     dns.RR
 }
 
+// Kinds of record changes reported by Describe. A record whose rdata is
+// unchanged but whose TTL moves is RecordTTLChanged; when rdata itself at
+// an owner/type is replaced, the disappearance and appearance are paired as
+// RecordContentChanged.
+const (
+	RecordAdded          = "added"
+	RecordDeleted        = "deleted"
+	RecordContentChanged = "content-changed"
+	RecordTTLChanged     = "ttl-changed"
+)
+
+// RecordChange describes how one record (or one owner/type pair for a
+// content change) differs between two versions. OldRR is nil for an added
+// record and NewRR is nil for a deleted one; for content and TTL changes
+// both sides are present so callers can show before/after text.
+type RecordChange struct {
+	Kind  string
+	Name  string // lowercase FQDN owner
+	Type  uint16 // dns record type
+	OldRR dns.RR // nil when Kind == RecordAdded
+	NewRR dns.RR // nil when Kind == RecordDeleted
+}
+
+func snapshotRRMap(snap *Snapshot) map[string]dns.RR {
+	m := map[string]dns.RR{}
+	if snap == nil {
+		return m
+	}
+	for _, rr := range snap.RRs {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			continue
+		}
+		m[rrKey(rr)] = rr
+	}
+	return m
+}
+
+// rrNameTypeKey identifies the RRset (owner + type) a record belongs to,
+// ignoring rdata and TTL.
+func rrNameTypeKey(rr dns.RR) string {
+	h := rr.Header()
+	return strings.ToLower(h.Name) + "|" + dns.TypeToString[h.Rrtype]
+}
+
 // Diff returns the changelog from old to new: deletions of records that
 // disappeared followed by additions of records that appeared. Each side
-// keeps TTL of the respective version so IXFR clients can update caches.
+// keeps TTL of the respective version so IXFR clients can update caches;
+// a record whose rdata is unchanged but whose TTL moves therefore appears
+// as a DEL with the old TTL followed by an ADD with the new TTL.
 // The apex SOA is excluded: its serial changes with every version and is
 // carried structurally by zone versions / the IXFR envelope.
 func Diff(old, new *Snapshot) []Change {
-	oldSet := map[string]dns.RR{}
-	newSet := map[string]dns.RR{}
-	collect := func(snap *Snapshot, dst map[string]dns.RR) {
-		if snap == nil {
-			return
-		}
-		for _, rr := range snap.RRs {
-			if rr.Header().Rrtype == dns.TypeSOA {
-				continue
-			}
-			dst[rrKey(rr)] = rr
-		}
-	}
-	collect(old, oldSet)
-	collect(new, newSet)
+	oldSet := snapshotRRMap(old)
+	newSet := snapshotRRMap(new)
 	var changes []Change
 	for k, rr := range oldSet {
-		if _, ok := newSet[k]; !ok {
+		nr, ok := newSet[k]
+		switch {
+		case !ok:
 			changes = append(changes, Change{Action: "DEL", RR: dns.Copy(rr)})
+		case rr.Header().Ttl != nr.Header().Ttl:
+			// Same owner/type/rdata, different TTL: replace the record so
+			// resolvers pick up the new caching interval.
+			changes = append(changes,
+				Change{Action: "DEL", RR: dns.Copy(rr)},
+				Change{Action: "ADD", RR: dns.Copy(nr)})
 		}
 	}
 	for k, rr := range newSet {
@@ -355,6 +396,142 @@ func Diff(old, new *Snapshot) []Change {
 	}
 	sortChanges(changes)
 	return changes
+}
+
+// Describe returns the same underlying comparison as Diff but grouped for
+// human/script review: pure additions, pure deletions, content changes
+// (a removed and an added RR at the same owner/type are paired) and TTL
+// changes (same owner/type/rdata, different TTL). The DEL/ADD expansion of
+// the returned groups equals Diff(old, new); the apex SOA is excluded just
+// as in the stored changelog. The result order is deterministic.
+func Describe(old, new *Snapshot) []RecordChange {
+	oldSet := snapshotRRMap(old)
+	newSet := snapshotRRMap(new)
+
+	type pending struct {
+		key string
+		rr  dns.RR
+	}
+	var removed, appeared []pending
+	var out []RecordChange
+	for k, orr := range oldSet {
+		nrr, ok := newSet[k]
+		switch {
+		case !ok:
+			removed = append(removed, pending{k, orr})
+		case orr.Header().Ttl != nrr.Header().Ttl:
+			out = append(out, RecordChange{
+				Kind:  RecordTTLChanged,
+				Name:  strings.ToLower(orr.Header().Name),
+				Type:  orr.Header().Rrtype,
+				OldRR: dns.Copy(orr), NewRR: dns.Copy(nrr),
+			})
+		}
+	}
+	for k, nrr := range newSet {
+		if _, ok := oldSet[k]; !ok {
+			appeared = append(appeared, pending{k, nrr})
+		}
+	}
+
+	// Pair a disappearance with an appearance at the same owner/type as a
+	// content change; anything left unpaired stays a plain add/delete.
+	delByRRset := map[string][]pending{}
+	addByRRset := map[string][]pending{}
+	for _, p := range removed {
+		delByRRset[rrNameTypeKey(p.rr)] = append(delByRRset[rrNameTypeKey(p.rr)], p)
+	}
+	for _, p := range appeared {
+		addByRRset[rrNameTypeKey(p.rr)] = append(addByRRset[rrNameTypeKey(p.rr)], p)
+	}
+	rrsetKeys := make(map[string]bool, len(delByRRset)+len(addByRRset))
+	for k := range delByRRset {
+		rrsetKeys[k] = true
+	}
+	for k := range addByRRset {
+		rrsetKeys[k] = true
+	}
+	for nt := range rrsetKeys {
+		dels := delByRRset[nt]
+		adds := addByRRset[nt]
+		sort.Slice(dels, func(i, j int) bool { return dels[i].key < dels[j].key })
+		sort.Slice(adds, func(i, j int) bool { return adds[i].key < adds[j].key })
+		pairs := len(dels)
+		if len(adds) < pairs {
+			pairs = len(adds)
+		}
+		for i := 0; i < pairs; i++ {
+			rr := dels[i].rr
+			out = append(out, RecordChange{
+				Kind:  RecordContentChanged,
+				Name:  strings.ToLower(rr.Header().Name),
+				Type:  rr.Header().Rrtype,
+				OldRR: dns.Copy(dels[i].rr), NewRR: dns.Copy(adds[i].rr),
+			})
+		}
+		for _, p := range dels[pairs:] {
+			out = append(out, RecordChange{
+				Kind:  RecordDeleted,
+				Name:  strings.ToLower(p.rr.Header().Name),
+				Type:  p.rr.Header().Rrtype,
+				OldRR: dns.Copy(p.rr),
+			})
+		}
+		for _, p := range adds[pairs:] {
+			out = append(out, RecordChange{
+				Kind:  RecordAdded,
+				Name:  strings.ToLower(p.rr.Header().Name),
+				Type:  p.rr.Header().Rrtype,
+				NewRR: dns.Copy(p.rr),
+			})
+		}
+	}
+
+	kindRank := map[string]int{
+		RecordDeleted:        0,
+		RecordAdded:          1,
+		RecordContentChanged: 2,
+		RecordTTLChanged:     3,
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		if out[i].Type != out[j].Type {
+			return out[i].Type < out[j].Type
+		}
+		if ki, kj := kindRank[out[i].Kind], kindRank[out[j].Kind]; ki != kj {
+			return ki < kj
+		}
+		var ri, rj dns.RR
+		if out[i].OldRR != nil {
+			ri = out[i].OldRR
+		} else {
+			ri = out[i].NewRR
+		}
+		if out[j].OldRR != nil {
+			rj = out[j].OldRR
+		} else {
+			rj = out[j].NewRR
+		}
+		return rrKey(ri) < rrKey(rj)
+	})
+	return out
+}
+
+// AffectedNames returns the sorted, de-duplicated owner names touched by
+// the given changes (additions, deletions, content or TTL changes).
+func AffectedNames(changes []RecordChange) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, c := range changes {
+		if !seen[c.Name] {
+			seen[c.Name] = true
+			names = append(names, c.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func sortChanges(ch []Change) {

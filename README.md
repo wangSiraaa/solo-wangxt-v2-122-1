@@ -33,11 +33,12 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / versions (publish supports -preview)
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
                      lookup (CNAME chase + wildcards), version diffing
-internal/store/      PostgreSQL: versions, records, change log, LISTEN notify
+internal/store/      PostgreSQL: versions, records, change log, LISTEN notify,
+                     read-only publish preview
 internal/server/     DNS handler: queries + AXFR/IXFR, TSIG/ACL gating
 scripts/             postgres bootstrap and dig verification
 testdata/            example zones and a TSIG key file
@@ -66,6 +67,29 @@ testdata/            example zones and a TSIG key file
    go build -o bin/dnszone ./cmd/dnszone
    ./bin/dnszone publish -config config.json -file testdata/zone-v1.db --note v1
    ```
+
+2a. Review before publishing. `-preview` runs the exact parsing and
+   validation rules of a publish and compares the candidate with the
+   current version, but performs no writes: it never allocates a serial,
+   inserts version/changelog rows, moves the current pointer or notifies
+   running servers (they keep answering the old snapshot):
+
+   ```sh
+   ./bin/dnszone publish -config config.json -file testdata/zone-v2.db -preview
+   ./bin/dnszone publish -config config.json -file testdata/zone-v2.db \
+       -preview -format json   # script-readable; exit 1 when validation fails
+   ```
+
+   The report groups record differences into **added**, **deleted**,
+   **content-changed** (rdata replaced at an owner/type) and
+   **ttl-changed** (same owner/type/rdata, different TTL), lists the
+   affected owner names and the validation **issues** (illegal TTL,
+   CNAME coexistence, apex CNAME, out-of-zone owner, unsupported type,
+   …), and carries the exact ordered `changelog` (DEL/ADD rows) that a
+   real publish would store — including DEL+ADD for a pure TTL change.
+   The apex SOA and master-file comments are excluded, so a
+   comment-only edit previews as no record differences. The projected
+   `next_serial` is shown for information only and is not consumed.
 
 3. Serve:
 
@@ -103,7 +127,10 @@ file (`dig -k`).
 
 - Each successful publish gets a monotonically increasing serial (the
   SOA serial is rewritten to it) and a stored change log (`ADD`/`DEL`
-  rows) derived from the previous version, excluding the SOA itself.
+  rows) derived from the previous version, excluding the SOA itself. A
+  record whose rdata is unchanged but whose TTL moves appears as a
+  DEL/ADD pair so resolvers learn the new caching interval; `publish
+  -preview` projects the identical rows ahead of time.
 - **AXFR** emits the complete version bracketed by identical SOA RRs.
   Because the handler captures the snapshot pointer once per request, a
   transfer that starts before a publish finishes keeps streaming the
@@ -121,13 +148,16 @@ go test -race ./...
 
 - `internal/zone`: TTL boundaries, same-name multi-records, CNAME
   conflicts, out-of-zone/unsupported-type rejection, CNAME chains,
-  wildcards, negative TTL, diff and AXFR ordering.
+  wildcards, negative TTL, diff and AXFR ordering, TTL-only diffs and
+  comment-only no-op diffs.
 - `internal/server`: AA/no-recursion answers, NXDOMAIN/NODATA
   authority, out-of-zone REFUSED, atomic snapshot swap, and TSIG+ACL
   transfer gating over real DNS sockets.
 - `internal/store` (runs against PostgreSQL; creates/uses
   `dnszone_test`): publish/load, rollback of invalid publishes,
-  concurrent publishing with no serial gaps, and change-log contents.
+  concurrent publishing with no serial gaps, change-log contents, and
+  read-only previews (no serial/version/changelog writes, identical
+  projected and stored changelogs, invalid candidates rejected).
 
 An end-to-end `dig` checklist (flags, negatives, AXFR/IXFR content and
 TSIG bookends) lives at `scripts/verify-dig.sh`.
