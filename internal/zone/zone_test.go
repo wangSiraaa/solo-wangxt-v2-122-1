@@ -164,20 +164,88 @@ func TestDiffExcludesSOA(t *testing.T) {
 		"www IN A 127.0.0.21\nwww IN A 127.0.0.22\n", 1)
 	v2 := mustParse(t, v2text, Limits{MinTTL: 30, MaxTTL: 86400})
 	s2, _ := NewSnapshot("lab.test.", 2, v2)
-	changes := Diff(s1, s2)
+	report := Compare(s1, s2)
 	var n int
-	for _, c := range changes {
+	for _, c := range report.Operations {
 		if c.RR.Header().Rrtype == dns.TypeSOA {
 			t.Fatal("SOA must not appear in changelog deltas")
 		}
 		n++
 	}
-	if n != 1 {
-		var b strings.Builder
-		for _, c := range changes {
-			b.WriteString(c.Action + " " + CanonicalText(c.RR) + "\n")
-		}
-		t.Fatalf("diff = %d changes, want 1 (only new A);\n%s", n, b.String())
+	if n != 1 || len(report.RecordChanges) != 1 {
+		t.Fatalf("diff = %d operations / %d semantic changes, want 1/1 (only new A)",
+			n, len(report.RecordChanges))
+	}
+	if report.RecordChanges[0].Kind != ChangeAdded ||
+		report.RecordChanges[0].Name != "www.lab.test." ||
+		report.RecordChanges[0].Type != "A" {
+		t.Fatalf("change = %+v, want added A at www.lab.test.", report.RecordChanges[0])
+	}
+	if got := report.AffectedNames; len(got) != 1 || got[0] != "www.lab.test." {
+		t.Fatalf("affected names = %v", got)
+	}
+}
+
+func TestCompareTTLChange(t *testing.T) {
+	v1 := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	v2text := strings.Replace(validZone,
+		`www IN TXT "hello"`,
+		`www 600 IN TXT "hello"`, 1)
+	v2 := mustParse(t, v2text, Limits{MinTTL: 30, MaxTTL: 86400})
+	s1, _ := NewSnapshot("lab.test.", 1, v1)
+	s2, _ := NewSnapshot("lab.test.", 2, v2)
+
+	report := Compare(s1, s2)
+	if len(report.RecordChanges) != 1 {
+		t.Fatalf("semantic changes = %d, want 1: %+v", len(report.RecordChanges), report.RecordChanges)
+	}
+	change := report.RecordChanges[0]
+	if change.Kind != ChangeTTL || change.OldTTL != 3600 || change.NewTTL != 600 {
+		t.Fatalf("TTL change = %+v", change)
+	}
+	if len(report.Operations) != 2 ||
+		report.Operations[0].Action != "DEL" || report.Operations[0].RR.Header().Ttl != 3600 ||
+		report.Operations[1].Action != "ADD" || report.Operations[1].RR.Header().Ttl != 600 {
+		t.Fatalf("TTL operations = %+v, want DEL(3600), ADD(600)", report.Operations)
+	}
+	if len(report.ChangeLog) != 2 {
+		t.Fatalf("change log = %+v, want two entries", report.ChangeLog)
+	}
+}
+
+func TestCompareContentChange(t *testing.T) {
+	v1 := mustParse(t, validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	v2text := strings.Replace(validZone,
+		`www IN TXT "hello"`,
+		`www IN TXT "goodbye"`, 1)
+	v2 := mustParse(t, v2text, Limits{MinTTL: 30, MaxTTL: 86400})
+	s1, _ := NewSnapshot("lab.test.", 1, v1)
+	s2, _ := NewSnapshot("lab.test.", 2, v2)
+
+	report := Compare(s1, s2)
+	if len(report.RecordChanges) != 1 || report.RecordChanges[0].Kind != ChangeContent {
+		t.Fatalf("changes = %+v, want one content change", report.RecordChanges)
+	}
+	if len(report.Operations) != 2 ||
+		report.Operations[0].Action != "DEL" ||
+		report.Operations[1].Action != "ADD" {
+		t.Fatalf("operations = %+v, want DEL then ADD", report.Operations)
+	}
+}
+
+func TestCompareIgnoresCommentsAndNoChange(t *testing.T) {
+	v1 := mustParse(t, "; old maintenance comment\n"+validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	v2 := mustParse(t, "; different maintenance comment\n"+validZone, Limits{MinTTL: 30, MaxTTL: 86400})
+	s1, _ := NewSnapshot("lab.test.", 1, v1)
+	s2, _ := NewSnapshot("lab.test.", 2, v2)
+
+	report := Compare(s1, s2)
+	if len(report.RecordChanges) != 0 || len(report.Operations) != 0 {
+		t.Fatalf("comment-only edit produced changes: %+v / %+v",
+			report.RecordChanges, report.Operations)
+	}
+	if len(report.AffectedNames) != 0 {
+		t.Fatalf("affected names = %v, want none", report.AffectedNames)
 	}
 }
 

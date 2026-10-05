@@ -46,6 +46,21 @@ func New(ctx context.Context, url, origin string) (*Store, error) {
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// NewPreview connects without performing schema migrations. Previews must
+// be strictly read-only; Preview treats a missing schema as an empty current
+// version rather than implicitly creating tables.
+func NewPreview(ctx context.Context, url, origin string) (*Store, error) {
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Store{pool: pool, origin: dns.Fqdn(strings.ToLower(origin))}, nil
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS zone_meta (
@@ -165,6 +180,82 @@ func (s *Store) LoadCurrent(ctx context.Context) (*zone.Snapshot, error) {
 	return s.LoadSnapshot(ctx, serial)
 }
 
+// PreviewResult is the read-only result of validating a candidate zone and
+// comparing it with the currently published snapshot.
+type PreviewResult struct {
+	CurrentSerial      uint32
+	CandidateSOASerial uint32
+	Diff               zone.DiffReport
+}
+
+// Preview applies exactly the store-side validation used by Publish and
+// compares the candidate to the current version. It starts a read-only
+// transaction, allocates no serial, writes no rows and sends no publish
+// notification; serving snapshots therefore remain unchanged.
+func (s *Store) Preview(ctx context.Context, rrs []dns.RR, lim zone.Limits) (*PreviewResult, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var currentSerial int64
+	err = tx.QueryRow(ctx,
+		`SELECT current_serial FROM zone_meta WHERE id = 1`).Scan(&currentSerial)
+	if err != nil {
+		// A preview may run before the first publish, when the schema has
+		// not been created yet. Treat that as an empty current version; the
+		// read-only transaction still performs no DDL or data writes.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			currentSerial = 0
+		} else {
+			return nil, err
+		}
+	}
+
+	var prev *zone.Snapshot
+	if currentSerial > 0 {
+		rows, err := tx.Query(ctx,
+			`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position`, currentSerial)
+		if err != nil {
+			return nil, err
+		}
+		prevRRs, err := scanRRs(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		prev, err = zone.NewSnapshot(s.origin, uint32(currentSerial), prevRRs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	checked := make([]dns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		if err := validateOne(rr, s.origin, lim); err != nil {
+			return nil, err
+		}
+		checked = append(checked, rr)
+	}
+	if err := validateAgainst(checked, s.origin, lim); err != nil {
+		return nil, err
+	}
+	candidate, err := zone.NewCandidateSnapshot(s.origin, checked)
+	if err != nil {
+		return nil, err
+	}
+	return &PreviewResult{
+		CurrentSerial:      uint32(currentSerial),
+		CandidateSOASerial: candidate.SOA().Serial,
+		Diff:               zone.Compare(prev, candidate),
+	}, nil
+}
+
 // PublishResult reports the outcome of a publish.
 type PublishResult struct {
 	Serial  uint32
@@ -270,7 +361,8 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 		batch.Queue(`INSERT INTO zone_records (serial, position, rr_text) VALUES ($1,$2,$3)`,
 			nextSerial, i, zone.CanonicalText(rr))
 	}
-	changes := zone.Diff(prev, snap)
+	diff := zone.Compare(prev, snap)
+	changes := diff.Operations
 	for i, ch := range changes {
 		batch.Queue(`INSERT INTO zone_changes (serial, position, action, rr_text) VALUES ($1,$2,$3,$4)`,
 			nextSerial, i, ch.Action, zone.CanonicalText(ch.RR))

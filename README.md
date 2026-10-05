@@ -60,12 +60,21 @@ testdata/            example zones and a TSIG key file
    Any PostgreSQL works; point `database_url` in `config.json` at it.
    The schema is created automatically on first start.
 
-2. Build and publish the first version:
+2. Build and preview/publish the first version:
 
    ```sh
    go build -o bin/dnszone ./cmd/dnszone
+   ./bin/dnszone publish -config config.json -file testdata/zone-v1.db --preview
    ./bin/dnszone publish -config config.json -file testdata/zone-v1.db --note v1
    ```
+
+   Previews use the same parser and TTL/zone-semantic validation as
+   publication, but run in a read-only transaction. They show added,
+   deleted, changed-content and TTL-changed records, the affected names
+   and the exact planned `ADD`/`DEL` change log. No SOA serial, version
+   row, change-log row or serving snapshot is modified. Add `--json` for
+   script-readable output; an invalid candidate exits non-zero with
+   `valid:false` and a `validation_issue`.
 
 3. Serve:
 
@@ -121,7 +130,8 @@ go test -race ./...
 
 - `internal/zone`: TTL boundaries, same-name multi-records, CNAME
   conflicts, out-of-zone/unsupported-type rejection, CNAME chains,
-  wildcards, negative TTL, diff and AXFR ordering.
+  wildcards, negative TTL, semantic diff (add/delete/content/TTL), comment-only
+  no-op diffs and AXFR ordering.
 - `internal/server`: AA/no-recursion answers, NXDOMAIN/NODATA
   authority, out-of-zone REFUSED, atomic snapshot swap, and TSIG+ACL
   transfer gating over real DNS sockets.

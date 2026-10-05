@@ -205,6 +205,16 @@ func Parse(r io.Reader, origin string, lim Limits) ([]dns.RR, error) {
 
 // NewSnapshot builds an immutable snapshot with a store-assigned serial.
 func NewSnapshot(origin string, serial uint32, rrs []dns.RR) (*Snapshot, error) {
+	return newSnapshot(origin, serial, rrs, true)
+}
+
+// NewCandidateSnapshot builds a validated snapshot for a file being checked
+// without rewriting the SOA serial. It is used by publish previews.
+func NewCandidateSnapshot(origin string, rrs []dns.RR) (*Snapshot, error) {
+	return newSnapshot(origin, 0, rrs, false)
+}
+
+func newSnapshot(origin string, serial uint32, rrs []dns.RR, rewriteSerial bool) (*Snapshot, error) {
 	origin = dns.Fqdn(origin)
 	for _, rr := range rrs {
 		if err := validateRR(rr, origin, Limits{MinTTL: 0, MaxTTL: ^uint32(0)}); err != nil {
@@ -217,13 +227,24 @@ func NewSnapshot(origin string, serial uint32, rrs []dns.RR) (*Snapshot, error) 
 	cp := make([]dns.RR, len(rrs))
 	for i, rr := range rrs {
 		c := dns.Copy(rr)
-		if soa, ok := c.(*dns.SOA); ok {
-			soa.Serial = serial
+		if rewriteSerial {
+			if soa, ok := c.(*dns.SOA); ok {
+				soa.Serial = serial
+			}
 		}
 		cp[i] = c
 	}
 	sortRRs(cp, origin)
-	s := &Snapshot{Origin: origin, Serial: serial, RRs: cp}
+	snapshotSerial := serial
+	if !rewriteSerial {
+		for _, rr := range cp {
+			if soa, ok := rr.(*dns.SOA); ok {
+				snapshotSerial = soa.Serial
+				break
+			}
+		}
+	}
+	s := &Snapshot{Origin: origin, Serial: snapshotSerial, RRs: cp}
 	s.buildIndex()
 	return s, nil
 }
@@ -321,40 +342,310 @@ type Change struct {
 	RR     dns.RR
 }
 
-// Diff returns the changelog from old to new: deletions of records that
-// disappeared followed by additions of records that appeared. Each side
-// keeps TTL of the respective version so IXFR clients can update caches.
-// The apex SOA is excluded: its serial changes with every version and is
-// carried structurally by zone versions / the IXFR envelope.
-func Diff(old, new *Snapshot) []Change {
-	oldSet := map[string]dns.RR{}
-	newSet := map[string]dns.RR{}
-	collect := func(snap *Snapshot, dst map[string]dns.RR) {
-		if snap == nil {
-			return
+// ChangeKind classifies a semantic record difference.
+type ChangeKind string
+
+const (
+	ChangeAdded   ChangeKind = "added"
+	ChangeDeleted ChangeKind = "deleted"
+	ChangeTTL     ChangeKind = "ttl_changed"
+	ChangeContent ChangeKind = "content_changed"
+)
+
+// RecordChange is a stable, machine-readable description of one semantic
+// difference between two snapshots. TTL and rdata changes each expand to
+// one DEL plus one ADD in the stored/IXFR change log.
+type RecordChange struct {
+	Kind   ChangeKind `json:"kind"`
+	Name   string     `json:"name"`
+	Type   string     `json:"type"`
+	OldRR  string     `json:"old_rr,omitempty"`
+	NewRR  string     `json:"new_rr,omitempty"`
+	OldTTL uint32     `json:"old_ttl,omitempty"`
+	NewTTL uint32     `json:"new_ttl,omitempty"`
+}
+
+// DiffReport contains both the semantic preview of a difference and the
+// ADD/DEL operations used by the published change log and IXFR.
+type DiffReport struct {
+	RecordChanges []RecordChange   `json:"record_changes"`
+	ChangeLog     []ChangeLogEntry `json:"change_log"`
+	AffectedNames []string         `json:"affected_names"`
+	Operations    []Change         `json:"-"`
+}
+
+// ChangeLogEntry is one machine-readable ADD/DEL operation in the same order
+// as the stored version change log.
+type ChangeLogEntry struct {
+	Action string `json:"action"`
+	RR     string `json:"rr"`
+}
+
+// Compare returns the semantic difference and corresponding ADD/DEL
+// operations from old to new. The apex SOA is excluded: its serial changes
+// with every version and is carried structurally by zone versions / the
+// IXFR envelope.
+//
+// Records are compared as multisets keyed by owner, type and rdata. A TTL
+// change is therefore reported as one ttl_changed record and emits DEL(old
+// TTL)+ADD(new TTL), preserving the change-log behavior used by caches and
+// IXFR clients.
+func Compare(old, new *Snapshot) DiffReport {
+	oldGroups := groupRecords(nonSOA(old))
+	newGroups := groupRecords(nonSOA(new))
+	keys := make([]groupKey, 0, len(oldGroups)+len(newGroups))
+	for k := range oldGroups {
+		keys = append(keys, k)
+	}
+	for k := range newGroups {
+		if _, ok := oldGroups[k]; !ok {
+			keys = append(keys, k)
 		}
-		for _, rr := range snap.RRs {
-			if rr.Header().Rrtype == dns.TypeSOA {
-				continue
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].owner != keys[j].owner {
+			return keys[i].owner < keys[j].owner
+		}
+		return keys[i].rrtype < keys[j].rrtype
+	})
+
+	var report DiffReport
+	for _, group := range keys {
+		oldRemaining := append([]dns.RR(nil), oldGroups[group]...)
+		newRemaining := append([]dns.RR(nil), newGroups[group]...)
+
+		// Exact matches (same rdata and TTL) are unchanged records.
+		oldByFull, newByFull := fullRecordMap(oldRemaining), fullRecordMap(newRemaining)
+		for fk := range oldByFull {
+			if common := min(len(oldByFull[fk]), len(newByFull[fk])); common > 0 {
+				oldRemaining = removeFull(oldRemaining, fk, common)
+				newRemaining = removeFull(newRemaining, fk, common)
 			}
-			dst[rrKey(rr)] = rr
+		}
+
+		// Remaining entries with the same rdata differ only in TTL. Sort both
+		// TTL variants so the pairing is deterministic when duplicate records
+		// use several different TTLs.
+		oldByContent, newByContent := contentRecordMap(oldRemaining), contentRecordMap(newRemaining)
+		contentKeys := make([]string, 0)
+		for rdata := range oldByContent {
+			if _, ok := newByContent[rdata]; ok {
+				contentKeys = append(contentKeys, rdata)
+			}
+		}
+		sort.Strings(contentKeys)
+		for _, rdata := range contentKeys {
+			os := sortedRRs(oldByContent[rdata])
+			ns := sortedRRs(newByContent[rdata])
+			common := min(len(os), len(ns))
+			for i := 0; i < common; i++ {
+				addRecordChange(&report, ChangeTTL, os[i], ns[i])
+			}
+			oldRemaining = removeContent(oldRemaining, rdata, common)
+			newRemaining = removeContent(newRemaining, rdata, common)
+		}
+
+		// Any balanced old/new remainder at this owner/type is an rdata
+		// replacement; an unbalanced count leaves explicit adds/deletes.
+		oldRemaining = sortedRRs(oldRemaining)
+		newRemaining = sortedRRs(newRemaining)
+		contentPairs := min(len(oldRemaining), len(newRemaining))
+		for i := 0; i < contentPairs; i++ {
+			addRecordChange(&report, ChangeContent, oldRemaining[i], newRemaining[i])
+		}
+		for i := contentPairs; i < len(oldRemaining); i++ {
+			addRecordChange(&report, ChangeDeleted, oldRemaining[i], nil)
+		}
+		for i := contentPairs; i < len(newRemaining); i++ {
+			addRecordChange(&report, ChangeAdded, nil, newRemaining[i])
 		}
 	}
-	collect(old, oldSet)
-	collect(new, newSet)
-	var changes []Change
-	for k, rr := range oldSet {
-		if _, ok := newSet[k]; !ok {
-			changes = append(changes, Change{Action: "DEL", RR: dns.Copy(rr)})
+
+	sortRecordChanges(report.RecordChanges)
+	report.Operations = operations(report.RecordChanges)
+	sortChanges(report.Operations)
+	report.ChangeLog = make([]ChangeLogEntry, 0, len(report.Operations))
+	for _, change := range report.Operations {
+		report.ChangeLog = append(report.ChangeLog, ChangeLogEntry{
+			Action: change.Action,
+			RR:     CanonicalText(change.RR),
+		})
+	}
+	report.AffectedNames = affectedNames(report.RecordChanges)
+	if report.RecordChanges == nil {
+		report.RecordChanges = []RecordChange{}
+	}
+	if report.AffectedNames == nil {
+		report.AffectedNames = []string{}
+	}
+	return report
+}
+
+type groupKey struct {
+	owner  string
+	rrtype string
+}
+
+type fullRecordKey struct {
+	rdata string
+	ttl   uint32
+}
+
+func groupRecords(rrs []dns.RR) map[groupKey][]dns.RR {
+	out := map[groupKey][]dns.RR{}
+	for _, rr := range rrs {
+		h := rr.Header()
+		k := groupKey{owner: strings.ToLower(h.Name), rrtype: dns.TypeToString[h.Rrtype]}
+		out[k] = append(out[k], rr)
+	}
+	return out
+}
+
+func fullRecordMap(rrs []dns.RR) map[fullRecordKey][]dns.RR {
+	out := map[fullRecordKey][]dns.RR{}
+	for _, rr := range rrs {
+		k := fullRecordKey{rdata: canonicalRdata(rr), ttl: rr.Header().Ttl}
+		out[k] = append(out[k], rr)
+	}
+	return out
+}
+
+func contentRecordMap(rrs []dns.RR) map[string][]dns.RR {
+	out := map[string][]dns.RR{}
+	for _, rr := range rrs {
+		k := canonicalRdata(rr)
+		out[k] = append(out[k], rr)
+	}
+	return out
+}
+
+func removeFull(rrs []dns.RR, k fullRecordKey, n int) []dns.RR {
+	return removeMatching(rrs, n, func(rr dns.RR) bool {
+		return canonicalRdata(rr) == k.rdata && rr.Header().Ttl == k.ttl
+	})
+}
+
+func removeContent(rrs []dns.RR, rdata string, n int) []dns.RR {
+	return removeMatching(rrs, n, func(rr dns.RR) bool {
+		return canonicalRdata(rr) == rdata
+	})
+}
+
+func removeMatching(rrs []dns.RR, n int, match func(dns.RR) bool) []dns.RR {
+	out := rrs[:0]
+	removed := 0
+	for _, rr := range rrs {
+		if removed < n && match(rr) {
+			removed++
+			continue
+		}
+		out = append(out, rr)
+	}
+	return out
+}
+
+func sortedRRs(rrs []dns.RR) []dns.RR {
+	sort.SliceStable(rrs, func(i, j int) bool {
+		if rrs[i].Header().Ttl != rrs[j].Header().Ttl {
+			return rrs[i].Header().Ttl < rrs[j].Header().Ttl
+		}
+		return canonicalRdata(rrs[i]) < canonicalRdata(rrs[j])
+	})
+	return rrs
+}
+
+func nonSOA(snap *Snapshot) []dns.RR {
+	if snap == nil {
+		return nil
+	}
+	out := make([]dns.RR, 0, len(snap.RRs))
+	for _, rr := range snap.RRs {
+		if rr.Header().Rrtype != dns.TypeSOA {
+			out = append(out, rr)
 		}
 	}
-	for k, rr := range newSet {
-		if _, ok := oldSet[k]; !ok {
-			changes = append(changes, Change{Action: "ADD", RR: dns.Copy(rr)})
+	return out
+}
+
+func addRecordChange(report *DiffReport, kind ChangeKind, oldRR, newRR dns.RR) {
+	change := RecordChange{Kind: kind}
+	var rr dns.RR
+	if oldRR != nil {
+		rr, change.OldRR, change.OldTTL = oldRR, CanonicalText(oldRR), oldRR.Header().Ttl
+	}
+	if newRR != nil {
+		rr, change.NewRR, change.NewTTL = newRR, CanonicalText(newRR), newRR.Header().Ttl
+	}
+	h := rr.Header()
+	change.Name = strings.ToLower(h.Name)
+	change.Type = dns.TypeToString[h.Rrtype]
+	report.RecordChanges = append(report.RecordChanges, change)
+}
+
+func operations(changes []RecordChange) []Change {
+	var out []Change
+	for _, change := range changes {
+		switch change.Kind {
+		case ChangeDeleted:
+			out = append(out, Change{Action: "DEL", RR: mustCanonicalRR(change.OldRR)})
+		case ChangeAdded:
+			out = append(out, Change{Action: "ADD", RR: mustCanonicalRR(change.NewRR)})
+		case ChangeTTL, ChangeContent:
+			out = append(out,
+				Change{Action: "DEL", RR: mustCanonicalRR(change.OldRR)},
+				Change{Action: "ADD", RR: mustCanonicalRR(change.NewRR)},
+			)
 		}
 	}
-	sortChanges(changes)
-	return changes
+	return out
+}
+
+func sortRecordChanges(changes []RecordChange) {
+	rank := map[ChangeKind]int{
+		ChangeDeleted: 0,
+		ChangeTTL:     1,
+		ChangeContent: 2,
+		ChangeAdded:   3,
+	}
+	sort.SliceStable(changes, func(i, j int) bool {
+		if changes[i].Name != changes[j].Name {
+			return changes[i].Name < changes[j].Name
+		}
+		if changes[i].Type != changes[j].Type {
+			return changes[i].Type < changes[j].Type
+		}
+		if rank[changes[i].Kind] != rank[changes[j].Kind] {
+			return rank[changes[i].Kind] < rank[changes[j].Kind]
+		}
+		return changes[i].OldRR+changes[i].NewRR < changes[j].OldRR+changes[j].NewRR
+	})
+}
+
+func affectedNames(changes []RecordChange) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, change := range changes {
+		if !seen[change.Name] {
+			seen[change.Name] = true
+			names = append(names, change.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func mustCanonicalRR(text string) dns.RR {
+	rr, err := dns.NewRR(text)
+	if err != nil {
+		panic(fmt.Sprintf("internal error: canonical RR %q is invalid: %v", text, err))
+	}
+	return rr
+}
+
+// Diff returns the DEL/ADD change log from old to new. See Compare for the
+// semantic differences and SOA handling.
+func Diff(old, new *Snapshot) []Change {
+	return Compare(old, new).Operations
 }
 
 func sortChanges(ch []Change) {

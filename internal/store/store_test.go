@@ -234,8 +234,107 @@ func TestChangelogDrivesIXFRDelta(t *testing.T) {
 	}
 }
 
-// content returns a zone text where variant adds `variant` extra host
-// records, giving each publish a distinct-but-related RR set.
+func TestPreviewIsReadOnlyAndMatchesNextChangelog(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+	candidate := parse(t, content(2))
+
+	preview, err := s.Preview(ctx, candidate, lim)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if preview.CurrentSerial != 1 || preview.CandidateSOASerial != 1 {
+		t.Fatalf("preview serials current=%d candidate=%d, want current 1 and unchanged candidate SOA 1",
+			preview.CurrentSerial, preview.CandidateSOASerial)
+	}
+	if len(preview.Diff.ChangeLog) != 1 {
+		t.Fatalf("preview changelog = %+v, want one ADD", preview.Diff.ChangeLog)
+	}
+	if got := preview.Diff.ChangeLog[0]; got.Action != "ADD" {
+		t.Fatalf("preview operation = %+v, want ADD", got)
+	}
+
+	serial, err := s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("after preview serial=%d err=%v, want 1", serial, err)
+	}
+	var versions int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_versions`).Scan(&versions); err != nil || versions != 1 {
+		t.Fatalf("versions after preview = %d, want 1", versions)
+	}
+	var changes int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM zone_changes`).Scan(&changes); err != nil || changes != 0 {
+		t.Fatalf("change rows after preview = %d, want 0", changes)
+	}
+
+	if _, err := s.Publish(ctx, candidate, "v2", lim); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	stored, err := s.LoadChanges(ctx, 2)
+	if err != nil || len(stored) != len(preview.Diff.ChangeLog) {
+		t.Fatalf("stored changes = %d (err=%v), want %d",
+			len(stored), err, len(preview.Diff.ChangeLog))
+	}
+	for i, want := range preview.Diff.ChangeLog {
+		got := stored[i].Action + " " + zone.CanonicalText(stored[i].RR)
+		wantText := want.Action + " " + want.RR
+		if got != wantText {
+			t.Fatalf("change %d after publish = %q, want preview %q", i, got, wantText)
+		}
+	}
+}
+
+func TestPreviewInvalidCandidateDoesNotAdvanceVersion(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+	soa := snapSOA(t, s, 1)
+	lowTTL := []dns.RR{
+		soa,
+		mustRR(t, "lab.test. 3600 IN NS ns1.lab.test."),
+		mustRR(t, "ns1.lab.test. 5 IN A 127.0.0.10"),
+	}
+	if _, err := s.Preview(ctx, lowTTL, lim); err == nil {
+		t.Fatal("preview of TTL below bound must fail")
+	}
+	cnameConflict := []dns.RR{
+		soa,
+		mustRR(t, "lab.test. 3600 IN NS ns1.lab.test."),
+		mustRR(t, "www.lab.test. 3600 IN A 127.0.0.20"),
+		mustRR(t, "www.lab.test. 3600 IN CNAME other.lab.test."),
+	}
+	if _, err := s.Preview(ctx, cnameConflict, lim); err == nil {
+		t.Fatal("preview of CNAME conflict must fail")
+	}
+	if serial, err := s.CurrentSerial(ctx); err != nil || serial != 1 {
+		t.Fatalf("after invalid previews serial=%d err=%v, want 1", serial, err)
+	}
+	snap, err := s.LoadCurrent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	as, found := snap.Lookup("ns1.lab.test.", dns.TypeA)
+	if !found || len(as) != 1 || as[0].Header().Ttl != 3600 {
+		t.Fatalf("current snapshot no longer serves old ns1 record: %+v found=%v", as, found)
+	}
+}
+
+func mustRR(t *testing.T, text string) dns.RR {
+	t.Helper()
+	rr, err := dns.NewRR(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rr
+}
+
 func content(variant int) string {
 	base := `$ORIGIN lab.test.
 $TTL 3600
